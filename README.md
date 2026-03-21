@@ -8,7 +8,7 @@ The [**fluxcd-topology-card**](https://github.com/dawg-io/fluxcd-topology-card) 
 
 It is built to work alongside this integration and enhances the monitoring experience by providing a graphical overview of your FluxCD resource dependencies — but it is entirely optional and not required for this integration to function.
 
-👉 [https://github.com/dawg-io/fluxcd-topology-card](https://github.com/dawg-io/fluxcd-topology-card)
+Repository: [fluxcd-topology-card on GitHub](https://github.com/dawg-io/fluxcd-topology-card)
 
 ## Features
 
