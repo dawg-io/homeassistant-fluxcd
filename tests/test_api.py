@@ -32,6 +32,8 @@ def _ensure_k8s_client_attrs():
         k8s_client.CustomObjectsApi = object
     if not hasattr(k8s_client, "VersionApi"):
         k8s_client.VersionApi = object
+    if not hasattr(k8s_client, "Configuration"):
+        k8s_client.Configuration = object
 
     k8s = sys.modules["kubernetes_asyncio"]
     if not hasattr(k8s, "client"):
@@ -75,7 +77,7 @@ class TestNotFoundHandling:
     @pytest.mark.asyncio
     async def test_404_does_not_emit_warning(self, caplog):
         """A 404 ApiException should be logged at DEBUG, not WARNING."""
-        flux_client = FluxKubernetesClient(access_mode="kubeconfig")
+        flux_client = FluxKubernetesClient(hass=MagicMock(), access_mode="kubeconfig")
         flux_client._api_client = object()
 
         with (
@@ -101,7 +103,7 @@ class TestNotFoundHandling:
     @pytest.mark.asyncio
     async def test_404_emits_debug_log(self, caplog):
         """A 404 ApiException should produce a DEBUG log about the CRD being unavailable."""
-        flux_client = FluxKubernetesClient(access_mode="kubeconfig")
+        flux_client = FluxKubernetesClient(hass=MagicMock(), access_mode="kubeconfig")
         flux_client._api_client = object()
 
         with (
@@ -126,7 +128,7 @@ class TestNotFoundHandling:
     @pytest.mark.asyncio
     async def test_non_404_api_exception_emits_warning(self, caplog):
         """A non-404 ApiException (e.g. 403 Forbidden) should still log at WARNING."""
-        flux_client = FluxKubernetesClient(access_mode="kubeconfig")
+        flux_client = FluxKubernetesClient(hass=MagicMock(), access_mode="kubeconfig")
         flux_client._api_client = object()
 
         with (
@@ -150,7 +152,7 @@ class TestNotFoundHandling:
     @pytest.mark.asyncio
     async def test_generic_exception_emits_warning(self, caplog):
         """A generic (non-ApiException) error should still log at WARNING."""
-        flux_client = FluxKubernetesClient(access_mode="kubeconfig")
+        flux_client = FluxKubernetesClient(hass=MagicMock(), access_mode="kubeconfig")
         flux_client._api_client = object()
 
         with (
@@ -174,7 +176,7 @@ class TestNotFoundHandling:
     @pytest.mark.asyncio
     async def test_404_returns_empty_list_for_missing_crd(self):
         """Resources from a 404-failing CRD should simply be absent from results."""
-        flux_client = FluxKubernetesClient(access_mode="kubeconfig")
+        flux_client = FluxKubernetesClient(hass=MagicMock(), access_mode="kubeconfig")
         flux_client._api_client = object()
 
         with (
@@ -190,3 +192,137 @@ class TestNotFoundHandling:
 
         assert result == []
 
+
+class TestAsyncInit:
+    """Tests for FluxKubernetesClient.async_init."""
+
+    @pytest.mark.asyncio
+    async def test_in_cluster_init_uses_executor_for_load_incluster_config(self):
+        """load_incluster_config() must not run on the event loop."""
+        hass = MagicMock()
+        hass.async_add_executor_job = AsyncMock(return_value=None)
+
+        load_incluster_config = MagicMock()
+        _api_module.config.load_incluster_config = load_incluster_config
+
+        flux_client = FluxKubernetesClient(
+            hass=hass, access_mode=_api_module.ACCESS_MODE_IN_CLUSTER
+        )
+        created_api_client = object()
+        flux_client._async_create_api_client = AsyncMock(return_value=created_api_client)
+
+        await flux_client.async_init()
+
+        hass.async_add_executor_job.assert_awaited_once_with(load_incluster_config)
+        load_incluster_config.assert_not_called()
+        flux_client._async_create_api_client.assert_awaited_once_with()
+        assert flux_client._api_client is created_api_client
+
+    @pytest.mark.asyncio
+    async def test_init_requires_hass(self):
+        """hass must be provided to guarantee non-blocking in-cluster config loading."""
+        with pytest.raises(ValueError, match="hass is required"):
+            FluxKubernetesClient(hass=None, access_mode=_api_module.ACCESS_MODE_IN_CLUSTER)
+
+    @pytest.mark.asyncio
+    async def test_kubeconfig_init_loads_kubeconfig_in_executor(self):
+        """Kubeconfig file reads must happen in the executor to avoid loop blocking."""
+        hass = MagicMock()
+
+        async def _run_in_executor(func, *args):
+            return func(*args)
+
+        hass.async_add_executor_job = AsyncMock(side_effect=_run_in_executor)
+
+        kubeconfig_node = object()
+        merger = MagicMock(config=kubeconfig_node)
+        api_client = object()
+        kube_config_module = MagicMock(KubeConfigMerger=MagicMock(return_value=merger))
+        load_kube_config_from_dict = AsyncMock()
+
+        with (
+            patch.object(
+                _api_module.config, "kube_config", kube_config_module, create=True
+            ),
+            patch.object(
+                _api_module.config,
+                "KUBE_CONFIG_DEFAULT_LOCATION",
+                "/default/.kube/config",
+                create=True,
+            ),
+            patch.object(
+                _api_module.config,
+                "load_kube_config_from_dict",
+                load_kube_config_from_dict,
+                create=True,
+            ),
+        ):
+            flux_client = FluxKubernetesClient(
+                hass=hass,
+                access_mode="kubeconfig",
+                kubeconfig_path="/config/.kube/config",
+            )
+            flux_client._async_create_api_client = AsyncMock(return_value=api_client)
+
+            await flux_client.async_init()
+
+            hass.async_add_executor_job.assert_awaited_once_with(
+                flux_client._load_kubeconfig, "/config/.kube/config"
+            )
+            kube_config_module.KubeConfigMerger.assert_called_once_with(
+                "/config/.kube/config"
+            )
+            load_kube_config_from_dict.assert_awaited_once()
+            called_kwargs = load_kube_config_from_dict.await_args.kwargs
+            assert called_kwargs["config_dict"] is kubeconfig_node
+            flux_client._async_create_api_client.assert_awaited_once_with(
+                called_kwargs["client_configuration"]
+            )
+            assert flux_client._api_client is api_client
+
+    @pytest.mark.asyncio
+    async def test_async_create_api_client_offloads_ssl_context_creation(self):
+        """SSL context creation (incl. cert loading) must run in executor."""
+        FluxKubernetesClient._cached_user_agent = None
+        ssl_context = MagicMock()
+        hass = MagicMock()
+        hass.async_add_executor_job = AsyncMock(side_effect=[ssl_context, "35.0.1"])
+        flux_client = FluxKubernetesClient(hass=hass, access_mode="kubeconfig")
+
+        client_configuration = MagicMock()
+        client_configuration.ssl_ca_cert = "/ca.crt"
+        client_configuration.cert_file = "/tls.crt"
+        client_configuration.key_file = "/tls.key"
+        client_configuration.connection_pool_maxsize = 8
+        client_configuration.tls_server_name = None
+        client_configuration.proxy = None
+        client_configuration.proxy_headers = None
+        client_configuration.client_side_validation = True
+
+        captured = {}
+
+        def _build_api_client(configuration, context, user_agent):
+            captured["cert_file_during_build"] = configuration.cert_file
+            captured["key_file_during_build"] = configuration.key_file
+            captured["context_during_build"] = context
+            captured["user_agent_during_build"] = user_agent
+            return object()
+
+        flux_client._build_api_client_with_ssl_context = MagicMock(side_effect=_build_api_client)
+        await flux_client._async_create_api_client(client_configuration)
+
+        hass.async_add_executor_job.assert_any_await(
+            flux_client._create_ssl_context,
+            "/ca.crt",
+            "/tls.crt",
+            "/tls.key",
+        )
+        hass.async_add_executor_job.assert_any_await(
+            flux_client._get_kubernetes_asyncio_version
+        )
+        assert captured["cert_file_during_build"] is None
+        assert captured["key_file_during_build"] is None
+        assert captured["context_during_build"] is ssl_context
+        assert captured["user_agent_during_build"] == "OpenAPI-Generator/35.0.1/python"
+        assert client_configuration.cert_file == "/tls.crt"
+        assert client_configuration.key_file == "/tls.key"
