@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import logging
+import ssl
+from importlib.metadata import PackageNotFoundError, version
 from typing import Any
 
+from homeassistant.core import HomeAssistant
 from kubernetes_asyncio import client, config
 from kubernetes_asyncio.client import ApiClient, CustomObjectsApi
+from kubernetes_asyncio.client.exceptions import ApiException
 
 from .const import (
     ACCESS_MODE_IN_CLUSTER,
@@ -31,6 +35,9 @@ from .const import (
 from .models import FluxResource, parse_controller_deployment, parse_flux_resource
 
 _LOGGER = logging.getLogger(__name__)
+# Match upstream kubernetes_asyncio REST client default (2 MiB) so large watch/list
+# responses still fit without reducing behavior or increasing memory use beyond default.
+KUBERNETES_CLIENT_READ_BUFFER_SIZE = 2**21
 
 
 class FluxKubernetesClient:
@@ -39,12 +46,16 @@ class FluxKubernetesClient:
     Supports both in-cluster and kubeconfig-based authentication.
     """
 
+    _cached_user_agent: str | None = None
+
     def __init__(
         self,
         access_mode: str,
         kubeconfig_path: str = "",
         namespace: str = "",
         label_selector: str = "",
+        *,
+        hass: HomeAssistant,
     ) -> None:
         """Initialize the FluxCD client.
 
@@ -53,7 +64,12 @@ class FluxKubernetesClient:
             kubeconfig_path: Path to kubeconfig file (required if access_mode is 'kubeconfig').
             namespace: Kubernetes namespace to scope queries. Empty string means all namespaces.
             label_selector: Optional Kubernetes label selector to filter resources.
+            hass: Home Assistant instance used to run blocking calls in the executor.
         """
+        if hass is None:
+            raise ValueError("hass is required")
+
+        self._hass = hass
         self._access_mode = access_mode
         self._kubeconfig_path = kubeconfig_path
         self._namespace = namespace
@@ -69,12 +85,123 @@ class FluxKubernetesClient:
         if self._access_mode == ACCESS_MODE_IN_CLUSTER:
             # load_incluster_config() configures the global default client
             # settings from the pod's service account credentials
-            config.load_incluster_config()
-            self._api_client = ApiClient()
+            await self._hass.async_add_executor_job(config.load_incluster_config)
+            self._api_client = await self._async_create_api_client()
         else:
-            self._api_client = await config.new_client_from_config(
-                config_file=self._kubeconfig_path or None
+            kubeconfig = await self._hass.async_add_executor_job(
+                self._load_kubeconfig, self._kubeconfig_path or None
             )
+            client_configuration = client.Configuration()
+            await config.load_kube_config_from_dict(
+                config_dict=kubeconfig,
+                client_configuration=client_configuration,
+            )
+            self._api_client = await self._async_create_api_client(client_configuration)
+
+    @staticmethod
+    def _load_kubeconfig(config_file: str | None) -> object:
+        """Load kubeconfig contents while keeping blocking file I/O off the event loop."""
+        kubeconfig_path = config_file or config.KUBE_CONFIG_DEFAULT_LOCATION
+        return config.kube_config.KubeConfigMerger(kubeconfig_path).config
+
+    @staticmethod
+    def _create_ssl_context(
+        ca_cert: str | None, cert_file: str | None, key_file: str | None
+    ) -> ssl.SSLContext:
+        """Create an SSL context, including optional client cert loading."""
+        ssl_context = ssl.create_default_context(cafile=ca_cert)
+        if cert_file:
+            ssl_context.load_cert_chain(cert_file, keyfile=key_file)
+        return ssl_context
+
+    async def _async_create_api_client(
+        self, client_configuration: client.Configuration | None = None
+    ) -> ApiClient:
+        """Create ApiClient while keeping certificate file reads off the event loop."""
+        configuration = client_configuration or client.Configuration.get_default_copy()
+        ssl_context = await self._hass.async_add_executor_job(
+            self._create_ssl_context,
+            configuration.ssl_ca_cert,
+            configuration.cert_file,
+            configuration.key_file,
+        )
+        if self.__class__._cached_user_agent is None:
+            kubernetes_asyncio_version = await self._hass.async_add_executor_job(
+                self._get_kubernetes_asyncio_version
+            )
+            self.__class__._cached_user_agent = self._default_user_agent(
+                kubernetes_asyncio_version
+            )
+        user_agent = self.__class__._cached_user_agent
+
+        cert_file = configuration.cert_file
+        key_file = configuration.key_file
+        # Prevent RESTClientObject from re-reading cert/key files on the event loop.
+        configuration.cert_file = None
+        configuration.key_file = None
+        try:
+            return self._build_api_client_with_ssl_context(
+                configuration, ssl_context, user_agent
+            )
+        finally:
+            configuration.cert_file = cert_file
+            configuration.key_file = key_file
+
+    @staticmethod
+    def _build_api_client_with_ssl_context(
+        configuration: client.Configuration,
+        ssl_context: ssl.SSLContext,
+        user_agent: str | None = None,
+    ) -> ApiClient:
+        """Build ApiClient using a preloaded SSL context (no sync cert file reads).
+
+        ApiClient.__init__ constructs RESTClientObject, which synchronously loads cert
+        files into an SSL context. We avoid that path here so file reads stay off-loop.
+        """
+        import aiohttp
+        from kubernetes_asyncio.client import rest
+
+        connector = aiohttp.TCPConnector(
+            limit=configuration.connection_pool_maxsize,
+            ssl=ssl_context,
+        )
+
+        rest_client = rest.RESTClientObject.__new__(rest.RESTClientObject)
+        rest_client.server_hostname = configuration.tls_server_name
+        rest_client.proxy = configuration.proxy
+        rest_client.proxy_headers = configuration.proxy_headers
+        rest_client.pool_manager = aiohttp.ClientSession(
+            connector=connector,
+            trust_env=True,
+            read_bufsize=KUBERNETES_CLIENT_READ_BUFFER_SIZE,
+        )
+
+        # We intentionally bypass ApiClient.__init__ because it would rebuild SSL context
+        # and re-read cert files on the event loop.
+        api_client = ApiClient.__new__(ApiClient)
+        api_client.configuration = configuration
+        api_client.pool_threads = 1
+        api_client.rest_client = rest_client
+        api_client.default_headers = {}
+        api_client.cookie = None
+        api_client.user_agent = user_agent or FluxKubernetesClient._default_user_agent()
+        api_client.client_side_validation = configuration.client_side_validation
+        return api_client
+
+    @staticmethod
+    def _get_kubernetes_asyncio_version() -> str | None:
+        """Return the installed kubernetes-asyncio version (may perform disk I/O)."""
+        try:
+            return version("kubernetes-asyncio")
+        except PackageNotFoundError:
+            return None
+
+    @staticmethod
+    def _default_user_agent(kubernetes_asyncio_version: str | None = None) -> str:
+        """Return a user agent aligned with installed kubernetes-asyncio version."""
+        if kubernetes_asyncio_version:
+            return f"OpenAPI-Generator/{kubernetes_asyncio_version}/python"
+        return "OpenAPI-Generator/python"
 
     async def async_close(self) -> None:
         """Close the Kubernetes API client connection."""
@@ -127,6 +254,18 @@ class FluxKubernetesClient:
                     category=flux_crd["category"],
                 )
                 all_resources.extend(resources)
+            except ApiException as exc:
+                if exc.status == 404:
+                    _LOGGER.debug(
+                        "%s CRD is not available on this cluster, skipping",
+                        flux_crd["kind"],
+                    )
+                else:
+                    _LOGGER.warning(
+                        "Failed to fetch %s resources, skipping",
+                        flux_crd["kind"],
+                        exc_info=True,
+                    )
             except Exception:
                 _LOGGER.warning(
                     "Failed to fetch %s resources, skipping",
