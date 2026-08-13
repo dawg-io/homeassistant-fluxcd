@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import os
 from typing import Any
 
 import voluptuous as vol
@@ -25,6 +24,11 @@ from .const import (
     DEFAULT_NAMESPACE,
     DEFAULT_SCAN_INTERVAL,
     DOMAIN,
+)
+from .kubeconfig import (
+    KubeconfigNotFound,
+    get_search_dirs_for_hass,
+    resolve_kubeconfig_path,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -58,11 +62,18 @@ async def validate_input(
     access_mode = data[CONF_ACCESS_MODE]
     kubeconfig_path = data.get(CONF_KUBECONFIG_PATH, "")
 
-    # Validate kubeconfig path if specified
-    if access_mode == ACCESS_MODE_KUBECONFIG and kubeconfig_path:
-        exists = await hass.async_add_executor_job(os.path.isfile, kubeconfig_path)
-        if not exists:
+    # Resolve the kubeconfig location before attempting to connect. The path may
+    # use ~ or environment variables, point at a directory, or be left empty —
+    # in which case the well-known locations are searched.
+    if access_mode == ACCESS_MODE_KUBECONFIG:
+        resolved_path = await hass.async_add_executor_job(
+            resolve_kubeconfig_path,
+            kubeconfig_path,
+            get_search_dirs_for_hass(hass),
+        )
+        if not resolved_path:
             raise InvalidKubeconfigPath
+        _LOGGER.debug("Resolved kubeconfig path to %s", resolved_path)
 
     k8s_client = FluxKubernetesClient(
         hass=hass,
@@ -78,8 +89,12 @@ async def validate_input(
             raise CannotConnect
     except CannotConnect:
         raise
-    except InvalidKubeconfigPath:
-        raise
+    except KubeconfigNotFound as err:
+        # The file disappeared between the check above and the load, or it
+        # turned out to be unreadable — report it as a path problem so the
+        # user sees the actionable message instead of "cannot connect".
+        _LOGGER.debug("Kubeconfig became unusable during validation: %s", err)
+        raise InvalidKubeconfigPath from err
     except Exception as err:
         _LOGGER.exception("Unexpected error during connection test")
         raise CannotConnect from err
