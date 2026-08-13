@@ -32,6 +32,11 @@ from .const import (
     FLUX_RESOURCESETINPUTPROVIDER,
     FLUX_SOURCES,
 )
+from .kubeconfig import (
+    KubeconfigNotFound,
+    get_search_dirs_for_hass,
+    require_kubeconfig_path,
+)
 from .models import FluxResource, parse_controller_deployment, parse_flux_resource
 
 _LOGGER = logging.getLogger(__name__)
@@ -89,7 +94,9 @@ class FluxKubernetesClient:
             self._api_client = await self._async_create_api_client()
         else:
             kubeconfig = await self._hass.async_add_executor_job(
-                self._load_kubeconfig, self._kubeconfig_path or None
+                self._load_kubeconfig,
+                self._kubeconfig_path or None,
+                get_search_dirs_for_hass(self._hass),
             )
             client_configuration = client.Configuration()
             await config.load_kube_config_from_dict(
@@ -99,10 +106,30 @@ class FluxKubernetesClient:
             self._api_client = await self._async_create_api_client(client_configuration)
 
     @staticmethod
-    def _load_kubeconfig(config_file: str | None) -> object:
-        """Load kubeconfig contents while keeping blocking file I/O off the event loop."""
-        kubeconfig_path = config_file or config.KUBE_CONFIG_DEFAULT_LOCATION
-        return config.kube_config.KubeConfigMerger(kubeconfig_path).config
+    def _load_kubeconfig(
+        config_file: str | None, search_dirs: list[str] | None = None
+    ) -> object:
+        """Load kubeconfig contents while keeping blocking file I/O off the event loop.
+
+        Resolves ``~``/environment variables in the configured path and falls
+        back to the well-known kubeconfig locations when no path is set.
+        """
+        kubeconfig_path = require_kubeconfig_path(config_file, search_dirs)
+        _LOGGER.debug("Loading kubeconfig from %s", kubeconfig_path)
+        try:
+            merged = config.kube_config.KubeConfigMerger(kubeconfig_path).config
+        except Exception as err:
+            # An empty or non-mapping file makes KubeConfigMerger fail deep
+            # inside the library; report the file we chose instead.
+            raise KubeconfigNotFound(
+                f"The kubeconfig file at '{kubeconfig_path}' is empty or is not "
+                f"valid kubeconfig YAML: {err}"
+            ) from err
+        if merged is None:
+            raise KubeconfigNotFound(
+                f"The kubeconfig file at '{kubeconfig_path}' is empty."
+            )
+        return merged
 
     @staticmethod
     def _create_ssl_context(
